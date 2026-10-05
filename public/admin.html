@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>社区公告发布平台 · 管理台</title>
+<link rel="stylesheet" href="/styles.css"/>
+</head>
+<body>
+<header>
+  <h1>📢 社区公告发布平台</h1>
+  <div class="tabs" id="tabs">
+    <button data-tab="notices" class="active">通知与审批</button>
+    <button data-tab="fleet">大屏与同步</button>
+    <button data-tab="plan">轮播排期</button>
+    <button data-tab="bg">背景轮播</button>
+    <button data-tab="events">事件与审计</button>
+  </div>
+  <div class="spacer"></div>
+  <select id="userSel" title="切换当前操作者（演示登录）"></select>
+  <a class="small" href="/screen" target="_blank">↗ 打开大屏</a>
+</header>
+<main id="view"></main>
+<div id="modalHost"></div>
+<script src="/scheduler.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>社区公告大屏</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:"PingFang SC","Microsoft YaHei",sans-serif}
+  #stage{position:fixed;inset:0;transition:background .8s}
+  #notice{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:4vw}
+  .card{max-width:82vw;background:rgba(8,14,26,.72);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.15);
+    border-radius:22px;padding:44px 56px;box-shadow:0 24px 80px rgba(0,0,0,.5)}
+  .type{font-size:1.6vw;letter-spacing:3px;opacity:.85}
+  .urgent .type{color:#ff8fa3}
+  .urgent .card{border-color:rgba(255,113,133,.6);box-shadow:0 0 0 2px rgba(251,113,133,.35),0 24px 80px rgba(0,0,0,.5)}
+  h2{font-size:3.6vw;margin:8px 0 18px}
+  .body{font-size:1.9vw;line-height:1.6;white-space:pre-wrap;color:#e8f1ff}
+  .link{margin-top:22px;font-size:1.5vw}
+  .link a{color:#7dd3fc}
+  .idle .card{opacity:.55}
+  #clock{position:absolute;top:18px;right:26px;font-size:1.3vw;color:rgba(255,255,255,.85);text-shadow:0 1px 4px #000}
+  #comm{position:absolute;top:18px;left:26px;font-size:1.3vw;color:rgba(255,255,255,.85);text-shadow:0 1px 4px #000}
+  #offlineBanner,#staleness{position:absolute;left:0;right:0;text-align:center;z-index:30;font-weight:700}
+  #offlineBanner{top:0;background:#b91c1c;color:#fff;padding:10px;font-size:1.4vw;display:none}
+  #staleness{bottom:0;background:rgba(0,0,0,.75);color:#fde68a;padding:8px;font-size:1.2vw;display:none}
+  .meta{margin-top:14px;font-size:1.15vw;opacity:.7}
+  #hud{position:absolute;bottom:8px;right:14px;font-size:11px;color:rgba(255,255,255,.35);z-index:40}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="comm"></div>
+  <div id="clock"></div>
+  <div id="notice"><div class="card"><div class="type">IDLE</div><h2>暂无公告</h2><div class="body">当前时间没有需要轮播的通知。</div></div></div>
+  <div id="offlineBanner">⚠ 与平台断开连接：以下内容来自本机缓存，可能已失效；重连后将强制与服务端对账。</div>
+  <div id="staleness"></div>
+  <div id="hud"></div>
+</div>
+<script src="/scheduler.js"></script>
+<script>
+'use strict';
+/* 大屏客户端：校时/完整+增量同步/离线TTL/防饥饿轮播/到期撤下/版本原子替换/截图上报 */
+const params = new URLSearchParams(location.search);
+const SCREEN_CODE = params.get('screen') || 'SCR-YG-01';
+const LS_KEY = 'screen_pkg_' + SCREEN_CODE;
+const HB_MS = 4000, SYNC_MS = 6000, SNAPSHOT_MS = 15000;
+const FORCE_BG_FAIL = params.get('bgfail') === '1'; // 验收：模拟本机背景应用失败
+
+const client = {
+  pkg: null,                 // 完整数据包（首次拉取或重连对账后建立）
+  correction: 0,             // correctedNow = Date.now() + correction
+  correctionAt: 0,
+  online: false,
+  lastHbOk: 0,
+  offlineSince: 0,
+  mode: 'full',
+  sched: { lastShown: {} },
+  bgIndex: 0,
+  bgStatus: 'ready',
+};
+const nowC = () => Date.now() + client.correction;
+
+async function jf(u, o) { const r = await fetch(u, o); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }
+function persist() {
+  if (client.pkg) localStorage.setItem(LS_KEY, JSON.stringify({
+    savedAt: Date.now(), pkg: client.pkg,
+  }));
+}
+function loadCache() {
+  try { const c = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); if (c && c.pkg) return c; } catch (_) {}
+  return null;
+}
+
+/* ---------- 校时 ---------- */
+async function heartbeat() {
+  const hb = await jf(`/screen/${SCREEN_CODE}/hb`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      deviceTime: Date.now(),
+      lastAppliedEventId: client.pkg ? client.pkg.eventId : 0,
+      scheduleHash: client.pkg ? client.pkg.scheduleHash : null,
+      bgStatus: client.bgStatus, bgAssetId: activeBg() ? activeBg().id : null,
+    }),
+  });
+  client.correction = hb.correctionMs; client.correctionAt = Date.now();
+  client.online = true; client.lastHbOk = Date.now();
+  if (hb.clockBack) { console.warn('检测到设备时钟倒退，已重置槽状态'); client.sched = { lastShown: {} }; }
+  return hb;
+}
+
+/* ---------- 同步：首次完整，之后增量；重连/怀疑缺事件则追平 ---------- */
+async function sync(forceFull) {
+  const since = (!forceFull && client.pkg && client.mode === 'delta') ? client.pkg.eventId : 0;
+  const pkg = await jf(`/screen/${SCREEN_CODE}/sync${since ? `?sinceEventId=${since}` : ''}`);
+  if (pkg.mode === 'full') applyFull(pkg);
+  else applyDelta(pkg);
+  persist();
+  await ackApplied();
+}
+function applyFull(p) {
+  client.pkg = p; client.mode = 'full';
+  enforceTombstones();
+  applyBackgrounds(p.backgrounds);
+}
+function applyDelta(p) {
+  // 原子应用：先在副本上折叠所有事件，成功后一次性替换展示状态（正文与报名入口同进同出）
+  const next = JSON.parse(JSON.stringify(client.pkg));
+  for (const e of p.events) {
+    if (e.type === 'notice_publish' || e.type === 'notice_update') {
+      const i = next.notices.findIndex(x => x.id === e.payload.id);
+      const def = e.payload;
+      if (i >= 0) next.notices[i] = def; else next.notices.push(def);
+      // 迟到的撤回之外，任何定义都带完整 body+link，杜绝旧文字配新入口
+    } else if (e.type === 'notice_withdraw') {
+      next.tombstones = Array.from(new Set([...(next.tombstones || []), e.noticeId]));
+      next.notices = next.notices.filter(x => x.id !== e.noticeId);
+    } else if (e.type === 'bg_update') {
+      next.backgrounds = e.payload;
+    }
+  }
+  // 追平对账：用服务端当前权威集合校正（即使中间事件丢失/被跳号）
+  if (p.currentIds) {
+    const have = new Set(next.notices.map(x => x.id));
+    const want = new Set(p.currentIds);
+    if (have.size !== want.size || [...want].some(id => !have.has(id)) || [...have].some(id => !want.has(id))) {
+      // 集合不一致：增量链已不足以追平，用附带权威 notices 替换
+      next.notices = p.notices;
+      next.tombstones = p.tombstones;
+    }
+  }
+  next.eventId = p.eventId;
+  next.scheduleHash = p.scheduleHash;
+  if (p.backgrounds) next.backgrounds = p.backgrounds;
+  client.pkg = next; client.mode = 'delta';
+  enforceTombstones();
+  applyBackgrounds(next.backgrounds);
+}
+function enforceTombstones() {
+  const t = new Set(client.pkg.tombstones || []);
+  const before = client.pkg.notices.length;
+  client.pkg.notices = client.pkg.notices.filter(n => !t.has(n.id));
+  return before !== client.pkg.notices.length;
+}
+function activeBg() {
+  const list = (client.pkg && client.pkg.backgrounds) || [];
+  if (!list.length) return null;
+  return list[client.bgIndex % list.length];
+}
+function applyBackgrounds(list) {
+  if (FORCE_BG_FAIL && list && list.length) { client.bgStatus = 'failed'; return; }
+  try {
+    // 真实设备在此应用资源；这里仅校验数据存在，不允许失败影响通知层
+    if (!Array.isArray(list)) throw new Error('bad_bg');
+    client.bgStatus = 'ready';
+  } catch (_) { client.bgStatus = 'failed'; }
+}
+async function ackApplied() {
+  if (!client.pkg) return;
+  const t = nowC();
+  const shown = client.pkg.notices.filter(n => n.start <= t && t < n.end).map(n => n.id);
+  await jf(`/screen/${SCREEN_CODE}/ack`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      lastAppliedEventId: client.pkg.eventId,
+      appliedNoticeIds: shown,
+      scheduleHash: client.pkg.scheduleHash,
+      bgStatus: client.bgStatus, bgAssetId: activeBg() ? activeBg().id : null,
+    }),
+  }).catch(() => {});
+}
+
+/* ---------- 渲染轮播 ---------- */
+function render() {
+  const t = nowC();
+  $('#clock').textContent = new Date(t).toLocaleString('zh-CN', { hour12: false });
+  const offline = !client.online || (Date.now() - client.lastHbOk > 20000);
+  const cache = loadCache();
+
+  if (!client.pkg && cache) client.pkg = cache.pkg; // 冷启动先读缓存，再等待对账
+
+  // 离线 TTL：超过宽限仍无法对账 => 撤下缓存通知内容，只保留占位
+  const pkg = client.pkg;
+  const staleAge = pkg ? Date.now() - (cache ? cache.savedAt : Date.now()) : Infinity;
+  const ttlExceeded = offline && cache && (Date.now() - cache.savedAt > 30 * 60 * 1000);
+
+  let defs = pkg ? pkg.notices.filter(n => n.start <= t && t < n.end) : [];
+  // 到期立即不参与选槽（允许演完当前槽由槽覆盖规则保证）
+  const s = Scheduler.slotGridStart(t);
+  const slot = Scheduler.slotAt(defs, s, null, client.sched);
+  let current = slot.kind === 'idle' ? null : defs.find(n => n.id === slot.id);
+
+  // 背景轮播（独立于通知层）
+  const bgList = (pkg && pkg.backgrounds) || [];
+  client.bgIndex = bgList.length ? Scheduler.bgIndexAt(t, bgList.length) : 0;
+  const bg = activeBg();
+  $('#stage').style.background = bg ? bg.value : '#0b1220';
+
+  // 显著时效说明（离线包 / 旧撤回残留 / TTL）
+  $('#offlineBanner').style.display = offline ? 'block' : 'none';
+  let staleMsg = [];
+  if (pkg) staleMsg.push('数据包事件水位 #' + pkg.eventId + (pkg.mode === 'delta' ? '（增量链）' : '（完整包）') + ' · 同步指纹 ' + pkg.scheduleHash);
+  if (offline && cache) staleMsg.push('本机缓存于 ' + new Date(cache.savedAt).toLocaleTimeString('zh-CN', { hour12: false }) + '，内容可能已过期');
+  const tombStill = pkg && (pkg.notices || []).some(n => (pkg.tombstones || []).includes(n.id));
+  if (tombStill) staleMsg.push('检测到撤回墓碑，已强制移除');
+  if (ttlExceeded) {
+    current = null; defs = [];
+    staleMsg.push('已超过离线展示宽限（30 分钟），公告内容强制撤下，等待重连对账');
+  }
+  $('#staleness').style.display = staleMsg.length ? 'block' : 'none';
+  $('#staleness').innerHTML = staleMsg.map(esc).join('<br>');
+
+  drawNotice(current, slot, offline);
+  $('#hud').textContent = `${SCREEN_CODE} · ${offline ? 'OFFLINE' : 'ONLINE'} · bg:${client.bgStatus}${FORCE_BG_FAIL ? '(sim-fail)' : ''} · slot ${new Date(slot.s).toLocaleTimeString('zh-CN', { hour12: false })}`;
+  document.body.className = (current ? (current.urgent ? 'urgent' : '') : 'idle');
+}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function drawNotice(n, slot, offline) {
+  const el = $('#notice');
+  if (!n) {
+    el.innerHTML = '<div class="card"><div class="type">IDLE</div><h2>暂无公告</h2><div class="body">当前时间没有需要轮播的通知。</div></div>';
+    return;
+  }
+  el.innerHTML = `<div class="card">
+    <div class="type">${n.urgent ? '紧急插播 · ' : ''}${({water:'停水通知',power:'停电通知',activity:'社区活动',notice:'社区通知'})[n.type]||'通知'} · v${n.version}</div>
+    <h2>${esc(n.title)}</h2>
+    <div class="body">${esc(n.body)}</div>
+    ${n.link ? `<div class="link">报名入口（与正文同版本 v${n.version}）：<a href="${esc(n.link)}" target="_blank">${esc(n.link)}</a></div>` : ''}
+    <div class="meta">有效期 ${new Date(n.start).toLocaleString('zh-CN',{hour12:false})} ~ ${new Date(n.end).toLocaleString('zh-CN',{hour12:false})}
+      ${offline ? ' · <span style="color:#fca5a5">离线展示中，请以重连后为准</span>' : ''}</div>
+  </div>`;
+}
+
+/* ---------- 截图上报（与服务端 as-of 有效清单绑定） ---------- */
+async function reportSnapshot() {
+  if (!client.pkg) return;
+  const t = nowC();
+  const defs = client.pkg.notices.filter(n => n.start <= t && t < n.end).map(n => n.id);
+  const s = Scheduler.slotGridStart(t);
+  const slot = Scheduler.slotAt(client.pkg.notices.filter(n => n.start <= t && t < n.end), s, null, client.sched);
+  await jf(`/screen/${SCREEN_CODE}/snapshot`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      at: t, shownNoticeIds: defs, currentSlotId: slot.kind === 'idle' ? null : slot.id,
+      scheduleHash: client.pkg.scheduleHash, mode: client.online ? 'online' : 'offline',
+      bgAssetId: activeBg() ? activeBg().id : null,
+    }),
+  }).catch(() => {});
+}
+
+/* ---------- 主循环 ---------- */
+async function loop() {
+  try {
+    const wasOffline = !client.online;
+    await heartbeat();
+    if (wasOffline || !client.pkg) await sync(true);  // 重连强制完整对账，撤掉离线旧内容
+    else await sync(false);                           // 常态增量
+  } catch (_) {
+    client.online = false;
+    if (!client.offlineSince) client.offlineSince = Date.now();
+  }
+  render();
+}
+const cache = loadCache();
+if (cache) { client.pkg = cache.pkg; }
+loop();
+setInterval(loop, Math.max(HB_MS, SYNC_MS));
+setInterval(render, 1000);
+setInterval(reportSnapshot, SNAPSHOT_MS);
+render();
+</script>
+</body>
+</html>

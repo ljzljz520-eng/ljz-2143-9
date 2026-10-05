@@ -1,0 +1,11 @@
+{
+  "name": "community-notice-broadcast",
+  "version": "1.0.0",
+  "description": "社区公告发布/审批/大屏轮播平台（持久化后端 + 紧急插播防饥饿 + 增量/完整同步 + 离线与时效控制）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/acceptance.js"
+  },
+  "license": "MIT"
+}

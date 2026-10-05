@@ -23,3 +23,10 @@ __pycache__/
 *.log
 .env
 .env.*
+
+# 运行时持久化数据（数据库快照/WAL），不入库
+/data/db.json
+/data/db.wal
+/data/test/
+/data/t1/
+/data/dur/
